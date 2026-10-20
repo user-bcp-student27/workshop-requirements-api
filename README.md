@@ -4,6 +4,8 @@
 
 API FastAPI que administra tareas del workshop y recibe archivos de requerimientos. Usa SQLite y consume el token emitido por el backend Quarkus.
 
+La API valida JWT HS256 con `AUTH_TOKEN_SECRET`, que debe coincidir con el configurado en el backend de autenticación y tener al menos 32 bytes. Las cargas aceptan `.txt`, `.md` y `.pdf`, con un máximo de 10 MiB.
+
 ## Ejecución
 
 Requisitos: Python 3.13.

@@ -1,29 +1,92 @@
 from __future__ import annotations
 
 import base64
+import binascii
+import hashlib
+import hmac
+import json
 import os
 import sqlite3
 import time
 from pathlib import Path
+from pathlib import PureWindowsPath
 from typing import Any
 
 import urllib3
 from fastapi import Body, Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
-LEGACY_SECRET = "WORKSHOP_SECRET_2026"
+TOKEN_ISSUER = "workshop-auth-backend"
+TOKEN_AUDIENCE = "workshop-requirements-api"
+TOKEN_ALGORITHM = "HS256"
+TOKEN_TTL_SECONDS = 3600
+MIN_TOKEN_SECRET_BYTES = 32
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+ALLOWED_UPLOAD_EXTENSIONS = {".txt", ".md", ".pdf"}
+
+
+def _decode_token_segment(segment: str) -> bytes:
+    if not segment:
+        raise ValueError("empty token segment")
+    padded = segment + "=" * (-len(segment) % 4)
+    return base64.b64decode(padded, altchars=b"-_", validate=True)
+
+
+def _verify_token(token: str, secret: str) -> dict[str, str]:
+    if len(secret.encode("utf-8")) < MIN_TOKEN_SECRET_BYTES:
+        raise RuntimeError("AUTH_TOKEN_SECRET must contain at least 32 bytes")
+
+    segments = token.split(".")
+    if len(segments) != 3:
+        raise ValueError("invalid token structure")
+
+    header = json.loads(_decode_token_segment(segments[0]))
+    claims = json.loads(_decode_token_segment(segments[1]))
+    if not isinstance(header, dict) or header.get("alg") != TOKEN_ALGORITHM or header.get("typ") != "JWT":
+        raise ValueError("invalid token header")
+    if not isinstance(claims, dict):
+        raise ValueError("invalid token claims")
+
+    signing_input = f"{segments[0]}.{segments[1]}".encode("ascii")
+    expected_signature = hmac.new(secret.encode("utf-8"), signing_input, hashlib.sha256).digest()
+    supplied_signature = _decode_token_segment(segments[2])
+    if not hmac.compare_digest(expected_signature, supplied_signature):
+        raise ValueError("invalid token signature")
+
+    subject = claims.get("sub")
+    role = claims.get("role")
+    client = claims.get("client")
+    issued_at = claims.get("iat")
+    expires_at = claims.get("exp")
+    if not all(isinstance(value, str) and value for value in (subject, role, client)):
+        raise ValueError("invalid token identity")
+    if role not in {"STUDENT", "TRAINER"}:
+        raise ValueError("invalid token role")
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in (issued_at, expires_at)):
+        raise ValueError("invalid token timestamps")
+    if claims.get("iss") != TOKEN_ISSUER or claims.get("aud") != TOKEN_AUDIENCE:
+        raise ValueError("invalid token issuer or audience")
+
+    now = int(time.time())
+    if issued_at > now + 60 or expires_at <= now or expires_at <= issued_at:
+        raise ValueError("expired or not-yet-valid token")
+    if expires_at - issued_at > TOKEN_TTL_SECONDS:
+        raise ValueError("token lifetime exceeds the allowed limit")
+
+    return {"username": subject, "role": role}
 
 
 def legacy_identity(authorization: str = Header(default="")) -> dict[str, str]:
+    secret = os.getenv("AUTH_TOKEN_SECRET")
+    if secret is None or len(secret.encode("utf-8")) < MIN_TOKEN_SECRET_BYTES:
+        raise HTTPException(status_code=503, detail="Token validation is not configured")
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid token")
+
     try:
-        token = authorization.replace("Bearer ", "")
-        decoded = base64.b64decode(token).decode("utf-8")
-        parts = decoded.split("|")
-        if len(parts) != 4 or parts[3] != LEGACY_SECRET or int(parts[2]) < int(time.time()):
-            raise ValueError("invalid token")
-        return {"username": parts[0], "role": parts[1]}
-    except Exception as error:
-        raise HTTPException(status_code=401, detail="Invalid token: " + str(error)) from error
+        return _verify_token(authorization.removeprefix("Bearer "), secret)
+    except (ValueError, TypeError, UnicodeError, binascii.Error) as error:
+        raise HTTPException(status_code=401, detail="Invalid token") from error
 
 
 def create_app(db_path: str | None = None, upload_dir: str | None = None) -> FastAPI:
@@ -67,8 +130,10 @@ def create_app(db_path: str | None = None, upload_dir: str | None = None) -> Fas
     @app.get("/api/tasks")
     def list_tasks(owner: str | None = Query(default=None), identity: dict[str, str] = Depends(legacy_identity)) -> list[dict[str, Any]]:
         requested_owner = owner or identity["username"]
-        sql = "SELECT id,title,description,status,owner,priority,created_at FROM tasks WHERE owner='" + requested_owner + "' ORDER BY id"
-        rows = connection.execute(sql).fetchall()
+        if identity["role"] != "TRAINER" and requested_owner != identity["username"]:
+            raise HTTPException(status_code=403, detail="Not authorized to access this owner")
+        sql = "SELECT id,title,description,status,owner,priority,created_at FROM tasks WHERE owner=? ORDER BY id"
+        rows = connection.execute(sql, (requested_owner,)).fetchall()
         result: list[dict[str, Any]] = []
         for row in rows:
             result.append(as_task(row))
@@ -81,16 +146,26 @@ def create_app(db_path: str | None = None, upload_dir: str | None = None) -> Fas
         status = str(payload.get("status", "TODO"))
         priority = str(payload.get("priority", "MEDIUM"))
         owner = str(payload.get("owner", identity["username"]))
-        sql = "INSERT INTO tasks(title,description,status,owner,priority,created_at) VALUES ('" + title + "','" + description + "','" + status + "','" + owner + "','" + priority + "',datetime('now'))"
-        cursor = connection.execute(sql)
+        if identity["role"] != "TRAINER" and owner != identity["username"]:
+            raise HTTPException(status_code=403, detail="Not authorized to assign this owner")
+        sql = "INSERT INTO tasks(title,description,status,owner,priority,created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))"
+        cursor = connection.execute(sql, (title, description, status, owner, priority))
         connection.commit()
-        row = connection.execute("SELECT id,title,description,status,owner,priority,created_at FROM tasks WHERE id=" + str(cursor.lastrowid)).fetchone()
+        row = connection.execute(
+            "SELECT id,title,description,status,owner,priority,created_at FROM tasks WHERE id=?",
+            (cursor.lastrowid,),
+        ).fetchone()
         return as_task(row)
 
     @app.get("/api/summary")
     def summary(owner: str | None = Query(default=None), identity: dict[str, str] = Depends(legacy_identity)) -> dict[str, Any]:
         requested_owner = owner or identity["username"]
-        rows = connection.execute("SELECT status,priority FROM tasks WHERE owner='" + requested_owner + "'").fetchall()
+        if identity["role"] != "TRAINER" and requested_owner != identity["username"]:
+            raise HTTPException(status_code=403, detail="Not authorized to access this owner")
+        rows = connection.execute(
+            "SELECT status,priority FROM tasks WHERE owner=?",
+            (requested_owner,),
+        ).fetchall()
         response: dict[str, Any] = {"owner": requested_owner, "total": 0, "byStatus": {}, "highPriorityOpen": 0}
         for row in rows:
             response["total"] = response["total"] + 1
@@ -106,9 +181,31 @@ def create_app(db_path: str | None = None, upload_dir: str | None = None) -> Fas
 
     @app.post("/api/requirements", status_code=201)
     async def upload_requirement(file: UploadFile = File(...), identity: dict[str, str] = Depends(legacy_identity)) -> dict[str, Any]:
-        target = Path(selected_uploads) / str(file.filename)
-        content = await file.read()
-        target.write_bytes(content)
+        filename = file.filename or ""
+        if (
+            not filename
+            or filename in {".", ".."}
+            or Path(filename).name != filename
+            or PureWindowsPath(filename).drive
+            or "/" in filename
+            or "\\" in filename
+        ):
+            raise HTTPException(status_code=400, detail="Invalid file name")
+        if Path(filename).suffix.lower() not in ALLOWED_UPLOAD_EXTENSIONS:
+            raise HTTPException(status_code=415, detail="Unsupported file type")
+
+        content = await file.read(MAX_UPLOAD_BYTES + 1)
+        if len(content) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="File exceeds the 10 MiB limit")
+
+        upload_root = Path(selected_uploads).resolve()
+        target = Path(selected_uploads) / filename
+        resolved_target = target.resolve()
+        try:
+            resolved_target.relative_to(upload_root)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail="Invalid file path") from error
+        resolved_target.write_bytes(content)
         return {"owner": identity["username"], "fileName": file.filename, "storedAt": str(target), "size": len(content)}
 
     @app.get("/api/backend-health")
